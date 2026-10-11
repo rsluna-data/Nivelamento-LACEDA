@@ -1,0 +1,13 @@
+# Dados de entrada e saída
+data/raw/*
+data/processed/*
+reports/*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Configurações locais
+.env
