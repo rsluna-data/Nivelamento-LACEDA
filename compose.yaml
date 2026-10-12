@@ -7,11 +7,29 @@ services:
       discovery.type: single-node
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      PYSPARK_SUBMIT_ARGS: "--driver-memory 2g pyspark-shell"
     ports:
       - "127.0.0.1:9200:9200"
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
     restart: unless-stopped
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - pipeline
+    environment:
+      ES_URL: http://elasticsearch:9200
+      SPARK_LOCAL_IP: 127.0.0.1
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./src:/app/src
+    depends_on:
+      - elasticsearch
+    command: ["python", "-m", "src.main"]
 
 volumes:
   elasticsearch_data:

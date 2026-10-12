@@ -1,5 +1,6 @@
 # Dados de entrada e saída
 data/bruto/*
+data/raw/*
 data/processed/*
 reports/*
 
