@@ -1,6 +1,7 @@
 
 import re
 
+import pandas as pd
 from elasticsearch import Elasticsearch
 
 from src.preprocessing import normalize_street, normalize_text
@@ -13,7 +14,7 @@ def normalize_cep(value):
 
 
 def normalize_number(value):
-    """Padroniza o número do endereço, incluindo casos sem número."""
+    """Padroniza o número do endereço."""
     value = normalize_text(value)
 
     if not value or value in {"SN", "S N", "S/N", "SEM NUMERO"}:
@@ -22,16 +23,41 @@ def normalize_number(value):
     return value
 
 
+def normalize_municipio(value):
+    """Normaliza o código do município."""
+    value = str(value or "").strip()
+
+    if not value:
+        return ""
+
+    # Evita transformar um código numérico em número decimal.
+    if value.endswith(".0") and value[:-2].isdigit():
+        value = value[:-2]
+
+    return value
+
+
+def extract_sectors(hits):
+    """Extrai setores únicos dos documentos encontrados."""
+    return sorted({
+        str(hit["_source"]["codigo_setor"])
+        for hit in hits
+        if hit["_source"].get("codigo_setor")
+    })
+
+
 def search_address(
     client: Elasticsearch,
     logradouro: str,
     cep: str,
     numero: str,
+    municipio="",
     index_name: str = INDEX_NAME,
 ):
     logradouro_norm = normalize_street(logradouro)
     cep_norm = normalize_cep(cep)
     numero_norm = normalize_number(numero)
+    municipio_norm = normalize_municipio(municipio)
 
     if not logradouro_norm:
         return {
@@ -39,10 +65,21 @@ def search_address(
             "status_match": "NAO_ENCONTRADO",
             "metodo_match": "SEM_LOGRADOURO",
             "candidatos_setor": [],
+            "quantidade_documentos": 0,
+            "scores_candidatos": "",
         }
 
-    # 1. Busca exata pelo logradouro e por CEP OU número.
-    # Não exige que CEP e número estejam ambos corretos.
+    # Filtros geográficos compartilhados pelas buscas.
+    filters = []
+
+    if municipio_norm:
+        filters.append({
+            "term": {
+                "codigo_municipio_busca": municipio_norm
+            }
+        })
+
+    # 1. Busca exata: logradouro + CEP ou número.
     should = []
 
     if cep_norm:
@@ -61,7 +98,7 @@ def search_address(
             size=100,
             query={
                 "bool": {
-                    "filter": [
+                    "filter": filters + [
                         {
                             "term": {
                                 "logradouro_normalizado.keyword":
@@ -76,12 +113,7 @@ def search_address(
         )
 
         hits = response["hits"]["hits"]
-
-        setores = sorted({
-            hit["_source"]["codigo_setor"]
-            for hit in hits
-            if hit["_source"].get("codigo_setor")
-        })
+        setores = extract_sectors(hits)
 
         if len(setores) == 1:
             return {
@@ -89,6 +121,8 @@ def search_address(
                 "status_match": "MATCH_EXATO",
                 "metodo_match": "LOGRADOURO_EXATO_CEP_OU_NUMERO",
                 "candidatos_setor": setores,
+                "quantidade_documentos": len(hits),
+                "scores_candidatos": "",
             }
 
         if len(setores) > 1:
@@ -97,30 +131,70 @@ def search_address(
                 "status_match": "AMBIGUO",
                 "metodo_match": "EXATO_MULTIPLOS_SETORES",
                 "candidatos_setor": setores,
+                "quantidade_documentos": len(hits),
+                "scores_candidatos": "",
             }
 
-    # 2. Busca aproximada para levantar candidatos.
-    # O resultado não recebe setor automaticamente.
+    # 2. Busca aproximada: município, quando disponível,
+    # e todos os termos do logradouro, com tolerância a erros.
+    query = {
+        "bool": {
+            "filter": filters,
+            "must": [
+                {
+                    "match": {
+                        "logradouro_normalizado": {
+                            "query": logradouro_norm,
+                            "operator": "and",
+                            "fuzziness": "AUTO",
+                        }
+                    }
+                }
+            ],
+        }
+    }
+
+    # CEP e número aumentam a relevância, mas não são obrigatórios.
+    should = []
+
+    if cep_norm:
+        should.append({
+            "term": {"cep_normalizado": cep_norm}
+        })
+
+    if numero_norm:
+        should.append({
+            "term": {"numero_normalizado": numero_norm}
+        })
+
+    if should:
+        query["bool"]["should"] = should
+
     response = client.search(
         index=index_name,
-        size=20,
-        query={
-            "match": {
-                "logradouro_normalizado": {
-                    "query": logradouro_norm,
-                    "fuzziness": "AUTO",
-                }
-            }
-        },
+        size=100,
+        query=query,
     )
 
     hits = response["hits"]["hits"]
+    setores = extract_sectors(hits)
 
-    setores = sorted({
-        hit["_source"]["codigo_setor"]
+    scores = [
+        {
+            "codigo_setor": hit["_source"].get("codigo_setor"),
+            "score": hit.get("_score"),
+            "logradouro": hit["_source"].get("logradouro_normalizado"),
+            "cep": hit["_source"].get("cep_normalizado"),
+            "numero": hit["_source"].get("numero_normalizado"),
+            "municipio": hit["_source"].get("codigo_municipio"),
+        }
         for hit in hits
-        if hit["_source"].get("codigo_setor")
-    })
+    ]
+
+    scores_json = __import__("json").dumps(
+        scores,
+        ensure_ascii=False,
+    )
 
     if setores:
         return {
@@ -128,13 +202,17 @@ def search_address(
             "status_match": "AMBIGUO",
             "metodo_match": "BUSCA_APROXIMADA_REVISAO",
             "candidatos_setor": setores,
+            "quantidade_documentos": len(hits),
+            "scores_candidatos": scores_json,
         }
 
     return {
         "codigo_setor": None,
         "status_match": "NAO_ENCONTRADO",
-        "metodo_match": "SEM_CANDIDATOS",
+        "metodo_match": "SEM_CANDIDATOS_APROXIMADOS",
         "candidatos_setor": [],
+        "quantidade_documentos": 0,
+        "scores_candidatos": "",
     }
 
 
@@ -149,13 +227,12 @@ def match_dataframe(df, index_name=INDEX_NAME):
                 logradouro=row.get("consulta_logradouro", ""),
                 cep=row.get("consulta_cep", ""),
                 numero=row.get("consulta_numero", ""),
+                municipio=row.get("consulta_municipio", ""),
                 index_name=index_name,
             )
             results.append(result)
     finally:
         client.close()
-
-    import pandas as pd
 
     match_results = pd.DataFrame(results)
     output = df.copy()
@@ -163,9 +240,7 @@ def match_dataframe(df, index_name=INDEX_NAME):
     for column in match_results.columns:
         output[column] = match_results[column].values
 
-    output["candidatos_setor"] = output[
-        "candidatos_setor"
-    ].apply(
+    output["candidatos_setor"] = output["candidatos_setor"].apply(
         lambda values: ";".join(values)
         if isinstance(values, list)
         else ""

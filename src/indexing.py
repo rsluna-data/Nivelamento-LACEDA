@@ -25,6 +25,7 @@ def create_index(client, index_name=INDEX_NAME):
         "properties": {
             "codigo_endereco": {"type": "keyword"},
             "codigo_municipio": {"type": "keyword"},
+            "codigo_municipio_busca": {"type": "keyword"},
             "codigo_setor": {"type": "keyword"},
             "cep_normalizado": {"type": "keyword"},
             "numero_normalizado": {"type": "keyword"},
@@ -67,6 +68,9 @@ def _index_partition(rows, index_name):
                 ),
                 "codigo_municipio": data.get(
                     "cod_municipio"
+                ),
+                "codigo_municipio_busca": municipio_para_busca(
+                    data.get("cod_municipio")
                 ),
                 "codigo_setor": data.get("cod_setor"),
                 "cep_normalizado": data.get(
@@ -118,7 +122,25 @@ def _index_partition(rows, index_name):
                 )
     finally:
         client.close()
+        
+def normalize_codigo_municipio(value):
+    """Normaliza o código municipal da CNFE."""
+    value = str(value or "").strip()
 
+    if value.endswith(".0") and value[:-2].isdigit():
+        value = value[:-2]
+
+    return value
+
+
+def municipio_para_busca(value):
+    """Gera o código auxiliar para comparar com a base de busca."""
+    codigo = normalize_codigo_municipio(value)
+
+    if len(codigo) == 7 and codigo.isdigit():
+        return codigo[:-1]
+
+    return ""
 
 def index_dataframe(df, index_name=INDEX_NAME):
     client = get_client()
